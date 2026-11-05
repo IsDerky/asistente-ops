@@ -30,6 +30,20 @@ npx wrangler deploy
 
 La URL queda en `https://ops-watchdog.<subdominio>.workers.dev`.
 
+### Con Terraform
+
+`terraform/` declara lo mismo como código: el namespace KV, el Worker con sus bindings (KV, secretos y el ID de Discord), el cron y la URL de `workers.dev`.
+
+```bash
+bun build src/index.ts --outfile dist/worker.js --target browser --format esm
+cd terraform
+cp terraform.tfvars.example terraform.tfvars   # cuenta, token de las señales, bot de Discord
+export CLOUDFLARE_API_TOKEN=...                 # permisos de Workers Scripts y Workers KV
+terraform init && terraform plan
+```
+
+El estado se queda en local y fuera de git, porque guarda los secretos de los bindings en claro. Para compartirlo habría que llevarlo a un backend remoto cifrado. El CI solo pasa `fmt` y `validate`; no despliega nada.
+
 ## Servidor
 
 Ver `server-scripts/`: `ops-ping`, `ops-ping-servidor.{service,timer}` y la
