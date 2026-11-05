@@ -1,0 +1,21 @@
+{
+  "name": "asistente-bot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "resumen": "bun src/cli.ts resumen",
+    "preguntar": "bun src/cli.ts preguntar"
+  },
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "groq-sdk": "^1.6.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "bun-types": "^1.4.4",
+    "typescript": "^7.0.2"
+  }
+}
