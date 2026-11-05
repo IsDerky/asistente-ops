@@ -44,7 +44,7 @@ El recolector corre como root porque necesita leer SMART, el journal y fail2ban.
 - **Caducidades**: certificados (avisa a 20, 7 y 2 días), dominios por RDAP y recordatorios que le dicto ("recuérdame el 5/12 renovar…").
 - **Resumen diario** por la mañana con lo que importa: backups, caducidades, ataques, el servidor de clientes que más RAM usa…
 - **Solo avisa de lo grave.** Las anomalías de logs las aprende en silencio y me las cuenta si le pregunto; probé a avisar de todo y era ruido.
-- **API local para el panel de la LAN** (`/api/state`, `/api/events` por SSE, `/api/honeypot`…). Escucha solo en `127.0.0.1` y nginx la publica solo para la LAN.
+- **API local para el [panel de la LAN](https://github.com/IsDerky/oficina-pixel)** (`/api/state`, `/api/events` por SSE, `/api/honeypot`…). Escucha solo en `127.0.0.1` y nginx la publica solo para la LAN.
 
 Solo atiende DMs de un usuario. Su ID está fijado en el código (`bot/src/config.ts`), no en el `.env`: si el `.env` se escribe mal, el bot no arranca, en vez de abrirle la puerta a otro.
 
