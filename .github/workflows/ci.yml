@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ci-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Bot
+        working-directory: bot
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun test
+      - name: Vigilante
+        working-directory: watchdog
+        run: |
+          bun install --frozen-lockfile
+          bun test
+      - name: Recolector (sintaxis)
+        run: python3 -m py_compile collector/ops-collect
+      - name: Scripts de despliegue (sintaxis)
+        run: bash -n deploy/install.sh
