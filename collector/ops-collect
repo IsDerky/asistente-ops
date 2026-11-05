@@ -1,0 +1,1013 @@
+#!/usr/bin/env python3
+"""Recolector del asistente: foto del estado del servidor en JSON.
+
+Corre como root (timer ops-collect, cada 5 min) porque necesita systemctl,
+smartctl, docker y la BD del panel. El bot NO tiene privilegios: solo lee el
+JSON que deja aquí. Sin IA y sin red: todo local y determinista.
+
+Pterodactyl: de los servidores de clientes solo se leen métricas desde el host
+(`docker stats` y el nombre en la BD del panel). Nunca se entra en ellos.
+
+Salida (legible por el grupo opsbot):
+  /var/lib/ops-collect/snapshot.json  la foto del estado
+  /var/lib/ops-collect/logs.json      últimos lotes de avisos del journal, por huella
+"""
+
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from datetime import datetime, timezone
+
+OUT_DIR = os.environ.get("OPS_COLLECT_DIR", "/var/lib/ops-collect")
+LETSENCRYPT = os.environ.get("OPS_LETSENCRYPT_DIR", "/etc/letsencrypt/live")
+SIMULACRO = os.environ.get("OPS_SIMULACRO", "/var/lib/server-backup/simulacro.json")
+JOURNAL_CURSOR = os.path.join(OUT_DIR, "journal.cursor")
+# 24 lotes = 2 h: el bot tiene margen aunque se pare un rato.
+KEEP_LOG_BATCHES = 24
+# La primera vez se leen 7 días para aprender lo que es normal (sin avisar).
+SEED_SINCE = "-7d"
+MAX_PATTERNS_PER_BATCH = 500
+# Bun y Node mandan los errores por stderr y el journal los guarda como info:
+# de estos servicios también se recogen las líneas que parecen un error.
+WATCH_UNITS = (
+    "bentonime.service",
+    "asistente.service",
+    "code-2fa.service",
+    "cloudflared.service",
+    "wings.service",
+    "ops-collect.service",
+)
+WATCH_PREFIXES = ("server-backup@", "actions.runner.")
+ERROR_WORDS = re.compile(r"\b(error|err|fatal|panic|exception|failed|failure|traceback|unhandled)\b", re.I)
+# Ataques: lo que llega a los puertos abiertos al exterior y el honeypot.
+NGINX_LOG = os.environ.get("OPS_NGINX_LOG", "/var/log/nginx/access.log")
+COWRIE_LOG = os.environ.get("OPS_COWRIE_LOG", "/opt/honeypot/var/log/cowrie/cowrie.json")
+# La IP pública propia (pruebas desde el PC que vuelven por el NAT del router) no
+# es un ataque. Se resuelve en cada pasada por si el operador la cambia.
+OWN_HOSTS = [h for h in os.environ.get("OPS_OWN_HOSTS", "").split(",") if h]
+OWN_IPS_EXTRA = os.environ.get("OPS_OWN_IPS", "").split(",")
+TAIL_STATE = os.path.join(OUT_DIR, "tail.json")
+MAX_TAIL_BYTES = 50 * 2**20
+BENTO_CURRENT = "/home/bentonime/apps/current"
+# Cómo acabó el último despliegue (lo escribe scripts/deploy-release.sh de Bentonime).
+BENTO_LAST_DEPLOY = "/home/bentonime/apps/last-deploy.json"
+DISK = os.environ.get("OPS_COLLECT_DISK", "/dev/sda")
+SERVICES = [
+    "bentonime",
+    "cloudflared",
+    "nginx",
+    "wings",
+    "mariadb",
+    "redis-server",
+    "docker",
+    "fail2ban",
+    "smartd",
+    "code-server",
+    "code-2fa",
+]
+TIMERS = [
+    "ops-ping-servidor.timer",
+    "server-backup-sistema.timer",
+    "server-backup-clientes.timer",
+    "server-backup-mantenimiento.timer",
+]
+BACKUP_MODES = ["sistema", "clientes", "mantenimiento"]
+
+
+def run(cmd, timeout=30):
+    """stdout de un comando, o None si falla (el recolector nunca se cae)."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def section(fn):
+    try:
+        return fn()
+    except Exception as e:  # una sección rota no tumba las demás
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def system():
+    mem = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            key, value = line.split(":", 1)
+            mem[key] = int(value.split()[0]) * 1024
+    with open("/proc/uptime") as f:
+        uptime = float(f.read().split()[0])
+    load1, load5, load15 = os.getloadavg()
+    disks = {}
+    for path in ["/", "/var/lib/pterodactyl"]:
+        if os.path.exists(path):
+            du = shutil.disk_usage(path)
+            disks[path] = {"total": du.total, "used": du.used, "free": du.free}
+    return {
+        "hostname": os.uname().nodename,
+        "uptime_s": int(uptime),
+        "load": [round(load1, 2), round(load5, 2), round(load15, 2)],
+        "cpus": os.cpu_count(),
+        "mem_total": mem.get("MemTotal"),
+        "mem_available": mem.get("MemAvailable"),
+        "swap_used": mem.get("SwapTotal", 0) - mem.get("SwapFree", 0),
+        "disks": disks,
+    }
+
+
+def smart():
+    try:
+        r = subprocess.run(["smartctl", "-j", "-a", DISK], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"error": f"smartctl no disponible: {e}"}
+    # El código de salida es una máscara de bits: solo los bits 0-1 (línea de
+    # órdenes, no se pudo abrir el disco) son fatales. El resto (p. ej. 64:
+    # hay entradas en el registro de errores) vienen con datos válidos.
+    if r.returncode & 0b11:
+        return {"error": f"smartctl falló (código {r.returncode})"}
+    d = json.loads(r.stdout)
+    attrs = {a["name"]: a for a in d.get("ata_smart_attributes", {}).get("table", [])}
+
+    def raw(name):
+        a = attrs.get(name)
+        return a["raw"]["value"] if a else None
+
+    def value(name):
+        a = attrs.get(name)
+        return a["value"] if a else None
+
+    return {
+        "device": DISK,
+        "smartctl_exit_bits": r.returncode,
+        "model": d.get("model_name"),
+        "passed": d.get("smart_status", {}).get("passed"),
+        "temperature_c": d.get("temperature", {}).get("current"),
+        "power_on_hours": d.get("power_on_time", {}).get("hours"),
+        "wear_remaining_pct": value("Wear_Leveling_Count"),
+        "reallocated_sectors": raw("Reallocated_Sector_Ct"),
+        "total_lbas_written": raw("Total_LBAs_Written"),
+    }
+
+
+def unit_state(unit, props):
+    out = run(["systemctl", "show", unit, "--timestamp=unix", "-p", ",".join(props)])
+    if out is None:
+        return None
+    state = {}
+    for line in out.splitlines():
+        key, _, val = line.partition("=")
+        if val.startswith("@"):
+            val = int(val[1:])
+        state[key] = val
+    return state
+
+
+def services():
+    out = {}
+    for unit in SERVICES:
+        s = unit_state(unit, ["ActiveState", "SubState", "LoadState", "NRestarts"])
+        if s and s.get("LoadState") != "not-found":
+            out[unit] = s
+    for unit in TIMERS:
+        s = unit_state(unit, ["ActiveState", "NextElapseUSecRealtime", "LastTriggerUSec"])
+        if s:
+            out[unit] = s
+    return out
+
+
+def backups():
+    out = {}
+    for mode in BACKUP_MODES:
+        s = unit_state(
+            f"server-backup@{mode}.service",
+            [
+                "ActiveState",
+                "Result",
+                "ExecMainStatus",
+                "ExecMainStartTimestamp",
+                "ExecMainExitTimestamp",
+            ],
+        )
+        if s:
+            out[mode] = s
+    return out
+
+
+def panel_names():
+    """uuid del contenedor -> nombre del servidor en el panel (solo lectura)."""
+    out = run(["mariadb", "-N", "-B", "-e", "SELECT uuid, name FROM panel.servers"])
+    names = {}
+    for line in (out or "").splitlines():
+        uuid, _, name = line.partition("\t")
+        names[uuid] = name
+    return names
+
+
+def parse_size(text):
+    units = {"B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3}
+    text = text.strip().upper()
+    for unit in sorted(units, key=len, reverse=True):
+        if text.endswith(unit):
+            return int(float(text[: -len(unit)]) * units[unit])
+    return None
+
+
+def clients():
+    out = run(["docker", "stats", "--no-stream", "--format", "{{json .}}"], timeout=60)
+    if out is None:
+        return {"error": "docker stats falló"}
+    names = panel_names()
+    result = []
+    for line in out.splitlines():
+        c = json.loads(line)
+        used, _, limit = c.get("MemUsage", "").partition("/")
+        name = c.get("Name", "")
+        result.append(
+            {
+                "container": name,
+                "server": names.get(name),  # None: no es un servidor del panel
+                "cpu_pct": float(c.get("CPUPerc", "0").rstrip("%") or 0),
+                "mem_bytes": parse_size(used),
+                "mem_limit_bytes": parse_size(limit),
+            }
+        )
+    return result
+
+
+def certificates():
+    """Caducidad de cada certificado de Let's Encrypt (la carpeta es solo de root)."""
+    out = {}
+    if not os.path.isdir(LETSENCRYPT):
+        return out
+    for name in sorted(os.listdir(LETSENCRYPT)):
+        cert = os.path.join(LETSENCRYPT, name, "cert.pem")
+        if not os.path.exists(cert):
+            continue
+        end = run(["openssl", "x509", "-noout", "-enddate", "-in", cert])
+        if not end:
+            out[name] = {"error": "no se pudo leer el certificado"}
+            continue
+        # notAfter=Jan 27 04:07:19 2027 GMT
+        when = datetime.strptime(end.strip().split("=", 1)[1], "%b %d %H:%M:%S %Y %Z")
+        out[name] = {"expires_at": when.replace(tzinfo=timezone.utc).isoformat()}
+    return out
+
+
+def simulacro():
+    """Resultado del último simulacro de restauración (lo escribe server-backup)."""
+    try:
+        with open(SIMULACRO) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"error": "todavía no se ha hecho ningún simulacro"}
+
+
+# --- Logs -------------------------------------------------------------------
+# Cada aviso se reduce a una plantilla sin números, IDs, IPs ni rutas: dos
+# mensajes que solo cambian en eso tienen la misma huella. El bot decide qué
+# huellas son nuevas o se disparan; aquí solo se cuentan.
+
+NORMALIZERS = [
+    (re.compile(r"\x1b\[[0-9;]*m"), ""),
+    # Fechas tipo "[Oct 28 12:34:56]": si no, cada mes cambiarían todas las huellas.
+    (re.compile(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b"), "<mes>"),
+    (re.compile(r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b"), "<día>"),
+    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I), "<uuid>"),
+    (re.compile(r"\b(?:[0-9a-f]{2}:){5,}[0-9a-f]{2}\b", re.I), "<mac>"),
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b"), "<ip>"),
+    (re.compile(r"\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{1,4}\b", re.I), "<ip>"),
+    (re.compile(r"(?<![\w<])/[\w.@%+=:,~-]+(?:/[\w.@%+=:,~-]*)*"), "<ruta>"),
+    (re.compile(r"\b[0-9a-f]{8,}\b", re.I), "<hex>"),
+    (re.compile(r"\b[A-Za-z0-9_-]{32,}\b"), "<token>"),
+    (re.compile(r"\d+(?:\.\d+)?"), "<n>"),
+    (re.compile(r"\s+"), " "),
+]
+SECRETS = [
+    (re.compile(r"(?i)\b(pass(?:word)?|token|secret|api[_-]?key|authorization)([=:]\s*)\S+"), r"\1\2<oculto>"),
+    (re.compile(r"\b[A-Za-z0-9_-]{32,}\b"), "<oculto>"),
+]
+
+
+def normalize(msg):
+    for pattern, repl in NORMALIZERS:
+        msg = pattern.sub(repl, msg)
+    return msg.strip()
+
+
+def mask(msg):
+    """El ejemplo que llega al DM: el mensaje real, sin cosas con pinta de secreto."""
+    for pattern, repl in SECRETS:
+        msg = pattern.sub(repl, msg)
+    return msg.strip()
+
+
+def message_text(raw):
+    if isinstance(raw, list):  # journald manda los mensajes binarios como lista de bytes
+        return bytes(raw).decode("utf-8", "replace")
+    return raw or ""
+
+
+def unit_name(entry):
+    unit = (
+        entry.get("_SYSTEMD_UNIT")
+        or entry.get("_SYSTEMD_USER_UNIT")
+        or entry.get("SYSLOG_IDENTIFIER")
+        or "?"
+    )
+    # user@1001.service, session-604.scope… son la misma cosa con otro número.
+    return re.sub(r"\d+", "<n>", unit)
+
+
+def interesting(entry, msg):
+    if int(entry.get("PRIORITY", 6)) <= 4:  # warning o peor
+        return True
+    unit = entry.get("_SYSTEMD_UNIT", "")
+    watched = unit in WATCH_UNITS or unit.startswith(WATCH_PREFIXES)
+    return watched and bool(ERROR_WORDS.search(msg))
+
+
+def read_journal(args):
+    """Lee el journal; devuelve (código de salida, entradas parseadas)."""
+    proc = subprocess.Popen(
+        ["journalctl", "-o", "json", "--no-pager", "-q", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        errors="replace",
+    )
+    entries = []
+    for line in proc.stdout:
+        try:
+            entries.append(json.loads(line))
+        except ValueError:
+            continue
+    return proc.wait(), entries
+
+
+def fail2ban():
+    """IPs baneadas ahora mismo por cada jail (para la dashboard del honeypot)."""
+    out = run(["fail2ban-client", "status"])
+    if out is None:
+        return {"error": "fail2ban-client no responde"}
+    m = re.search(r"Jail list:\s*(.*)", out)
+    jails = [j.strip() for j in (m.group(1) if m else "").split(",") if j.strip()]
+    result = {}
+    for jail in jails:
+        st = run(["fail2ban-client", "status", jail]) or ""
+        banned = re.search(r"Banned IP list:\s*(.*)", st)
+        total = re.search(r"Total banned:\s*(\d+)", st)
+        result[jail] = {
+            "banned": (banned.group(1).split() if banned else [])[:500],
+            "total_banned": int(total.group(1)) if total else 0,
+        }
+    return result
+
+
+WINGS_CONFIG = os.environ.get("OPS_WINGS_CONFIG", "/etc/pterodactyl/config.yml")
+
+
+def wings():
+    """Estado en directo de TODOS los servidores de este nodo, según Wings.
+
+    Solo se leen el estado y los números de consumo; la respuesta de Wings
+    trae también la configuración de cada servidor (variables de entorno de los
+    clientes), que se descarta sin guardarla.
+    """
+    cfg = {}
+    with open(WINGS_CONFIG) as f:
+        section = None
+        for line in f:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            indent = len(line) - len(line.lstrip())
+            key, _, value = line.strip().partition(":")
+            value = value.strip().strip("'\"")
+            if indent == 0:
+                section = key
+                if value:
+                    cfg[key] = value
+            elif section == "api" and indent == 2:
+                cfg[f"api.{key}"] = value
+            elif section == "api" and key == "enabled":
+                cfg["api.ssl"] = value
+            elif section == "api" and key == "cert":
+                cfg["api.cert"] = value
+    token = cfg.get("token")
+    if not token:
+        return {"error": "sin token en la config de Wings"}
+    port = cfg.get("api.port", "8080")
+    host = re.sub(r"^https?://", "", cfg.get("remote", "")).split("/")[0]
+    # El certificado de Wings es para su dominio público: se resuelve a 127.0.0.1.
+    cert_host = re.search(r"/live/([^/]+)/", cfg.get("api.cert", ""))
+    node = os.environ.get("OPS_WINGS_HOST") or (cert_host.group(1) if cert_host else "localhost")
+    scheme = "https" if cfg.get("api.ssl", "false").lower() in ("true", "enabled") else "http"
+    # El token va por la entrada estándar (-H @-): en la línea de órdenes lo
+    # vería cualquiera con `ps`.
+    try:
+        r = subprocess.run(
+            [
+                "curl", "-fsS", "--max-time", "15",
+                "--resolve", f"{node}:{port}:127.0.0.1",
+                "-H", "@-",
+                "-H", "Accept: application/json",
+                f"{scheme}://{node}:{port}/api/servers",
+            ],
+            input=f"Authorization: Bearer {token}\n",
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        out = r.stdout if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        out = None
+    if out is None:
+        return {"error": f"Wings no responde en {scheme}://{node}:{port} (panel {host})"}
+    servers = []
+    for s in json.loads(out):
+        u = s.get("utilization") or {}
+        conf = s.get("configuration") or {}
+        servers.append(
+            {
+                "uuid": conf.get("uuid"),
+                "state": u.get("state") or s.get("state"),
+                "suspended": bool(s.get("is_suspended")),
+                "mem_bytes": u.get("memory_bytes"),
+                "mem_limit_bytes": u.get("memory_limit_bytes"),
+                "cpu_pct": round(float(u.get("cpu_absolute") or 0), 1),
+                "disk_bytes": u.get("disk_bytes"),
+                "uptime_ms": u.get("uptime"),
+            }
+        )
+    return servers
+
+
+WINGS_NODES = os.environ.get("OPS_WINGS_NODES", "/etc/ops-collect/wings-nodes.env")
+
+
+def wings_remote():
+    """Estado de los servidores de los OTROS nodos. Los tokens de sus Wings los
+    puso Alex a mano en WINGS_NODES (una línea `dominio[:puerto]=token`, solo
+    root). Solo lectura (GET /api/servers); la configuración se descarta."""
+    try:
+        with open(WINGS_NODES) as f:
+            lines = [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+    except FileNotFoundError:
+        return {}
+    out = {}
+    for line in lines:
+        host, _, token = line.partition("=")
+        host, token = host.strip(), token.strip()
+        if not host or not token:
+            continue
+        hostport = host if ":" in host else f"{host}:8080"
+        try:
+            r = subprocess.run(
+                ["curl", "-fsS", "--max-time", "15", "-H", "@-", "-H", "Accept: application/json", f"https://{hostport}/api/servers"],
+                input=f"Authorization: Bearer {token}\n",  # por stdin: en argv lo vería cualquiera con `ps`
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            out[host] = {"error": "no responde"}
+            continue
+        if r.returncode != 0:
+            out[host] = {"error": f"curl {r.returncode}: {r.stderr.strip()[:120]}"}
+            continue
+        servers = []
+        for s in json.loads(r.stdout):
+            u = s.get("utilization") or {}
+            conf = s.get("configuration") or {}
+            servers.append(
+                {
+                    "uuid": conf.get("uuid"),
+                    "state": u.get("state") or s.get("state"),
+                    "suspended": bool(s.get("is_suspended")),
+                    "mem_bytes": u.get("memory_bytes"),
+                    "mem_limit_bytes": u.get("memory_limit_bytes"),
+                    "cpu_pct": round(float(u.get("cpu_absolute") or 0), 1),
+                    "disk_bytes": u.get("disk_bytes"),
+                    "uptime_ms": u.get("uptime"),
+                }
+            )
+        out[host] = {"servers": servers}
+    return out
+
+
+def deploys():
+    """Versión de Bentonime en marcha y si el runner de GitHub está con un trabajo."""
+    out = {"runner_busy": run(["pgrep", "-f", "Runner.Worker"]) is not None}
+    try:
+        out["bentonime_release"] = os.path.basename(os.readlink(BENTO_CURRENT))
+        out["bentonime_deployed_at"] = datetime.fromtimestamp(os.lstat(BENTO_CURRENT).st_mtime, timezone.utc).isoformat()
+    except OSError:
+        pass
+    try:
+        with open(BENTO_LAST_DEPLOY, encoding="utf-8") as f:
+            raw = json.load(f)
+        # Solo los campos conocidos, como texto corto: el archivo es de otro usuario.
+        out["last_deploy"] = {k: str(raw.get(k, ""))[:64] for k in ("sha", "phase", "previous", "rollback", "at")}
+    except (OSError, ValueError, AttributeError):
+        pass
+    return out
+
+
+# --- Ataques ------------------------------------------------------------------
+# Se agrupan por (tipo, IP) en cada pasada. Privacidad de los clientes:
+#  - Wings: solo se guarda IP y usuario cuando el usuario no tiene el formato de
+#    Pterodactyl (usuario.id), o sea, seguro que no es un cliente. Los demás
+#    fallos de SFTP (un cliente puede equivocarse) solo suman a un contador.
+#  - nginx: solo IPs públicas y peticiones con firma de escáner; las normales
+#    al panel no se miran.
+#  - Cowrie: todo, es el honeypot.
+
+WINGS_INVALID = re.compile(r"failed to validate user credentials \(invalid format\) ip=([0-9a-f.:]+?):\d+\b.*?username=(\S*)")
+WINGS_NOAUTH = "sftp: failed to accept inbound connection error=[ssh: no auth passed yet"
+NGINX_LINE = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "((?:[^"\\]|\\.)*)" (\d{3}) \S+ "(?:[^"\\]|\\.)*" "((?:[^"\\]|\\.)*)"')
+PROBES = re.compile(
+    r"(wp-|xmlrpc|\.env|\.git/|phpmyadmin|/pma|/cgi-bin|/boaform|/hnap1|/actuator|phpunit|eval-stdin|"
+    r"/solr|/console|/manager/html|/owa/|autodiscover|/\.aws|/\.ssh|/config\.json|/geoserver|/druid|"
+    r"/shell|/setup\.cgi|/gponform|/remote/login|\.ds_store|/server-status|/admin\.php|\.action\b|"
+    r"/jenkins|/telescope|/_ignition|\.\./|%2e%2e|/etc/passwd|/bin/sh|/wls-wsat|/sdk|/ecp/|/cdn-cgi/bm)",
+    re.I,
+)
+LIMIT_KEYS = 50
+
+
+class Attacks:
+    def __init__(self):
+        self.by = {}
+        self.sftp_failed_other = 0
+
+    def hit(self, kind, ip, n=1):
+        r = self.by.get((kind, ip))
+        if r is None:
+            r = self.by[(kind, ip)] = {"kind": kind, "ip": ip, "count": 0}
+        r["count"] += n
+        return r
+
+    @staticmethod
+    def seen(r, ts):
+        """Hora real (ms) del último evento de la IP en el lote: el feed y la
+        línea de tiempo la usan en vez de la hora de la pasada."""
+        if ts and ts > r.get("ts", 0):
+            r["ts"] = ts
+
+    limit = LIMIT_KEYS
+
+    def bump(self, r, field, key, n=1):
+        d = r.setdefault(field, {})
+        if key in d or len(d) < self.limit:
+            d[key] = d.get(key, 0) + n
+
+    def push(self, r, field, item):
+        items = r.setdefault(field, [])
+        if len(items) < self.limit:
+            items.append(item)
+
+    def out(self):
+        return sorted(self.by.values(), key=lambda r: -r["count"])[:2000]
+
+
+_own_ips = None
+
+
+def own_ips():
+    global _own_ips
+    if _own_ips is None:
+        import socket
+
+        _own_ips = {ip.strip() for ip in OWN_IPS_EXTRA if ip.strip()}
+        for host in OWN_HOSTS:
+            try:
+                _own_ips |= {a[4][0] for a in socket.getaddrinfo(host.strip(), None)}
+            except (OSError, UnicodeError):
+                pass
+    return _own_ips
+
+
+def public_ip(ip):
+    try:
+        return ipaddress.ip_address(ip).is_global and ip not in own_ips()
+    except ValueError:
+        return False
+
+
+def journal_ms(e):
+    try:
+        return int(e["__REALTIME_TIMESTAMP"]) // 1000
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def iso_ms(s):
+    """'2026-11-01T15:27:01.123456Z' (Cowrie) → ms, o None."""
+    try:
+        return int(datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def nginx_ms(s):
+    """'01/Nov/2026:16:27:01 +0100' → ms, o None."""
+    try:
+        return int(datetime.strptime(s, "%d/%b/%Y:%H:%M:%S %z").timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def wings_attack(attacks, msg, ts=None):
+    m = WINGS_INVALID.search(msg)
+    if m and public_ip(m.group(1)):
+        r = attacks.hit("sftp", m.group(1))
+        attacks.seen(r, ts)
+        attacks.bump(r, "users", m.group(2)[:40])
+    elif WINGS_NOAUTH in msg or "failed to validate user credentials" in msg:
+        attacks.sftp_failed_other += 1
+
+
+def nginx_attack(attacks, line):
+    m = NGINX_LINE.match(line)
+    if not m or not public_ip(m.group(1)):
+        return
+    ip, when, request, status, agent = m.groups()
+    parts = request.split(" ")
+    path = parts[1] if len(parts) >= 2 else request
+    if len(parts) >= 2 and path.startswith("/") and not PROBES.search(path):
+        return
+    r = attacks.hit("web", ip)
+    attacks.seen(r, nginx_ms(when))
+    attacks.bump(r, "paths", f"{parts[0][:10]} {path[:120]}" if len(parts) >= 2 else request[:120] or "(vacía)")
+    attacks.bump(r, "status", status)
+    if agent and agent != "-":
+        r.setdefault("agent", agent[:120])
+
+
+COWRIE_EVENTS = {
+    "cowrie.session.connect",
+    "cowrie.login.failed",
+    "cowrie.login.success",
+    "cowrie.command.input",
+    "cowrie.session.file_download",
+    "cowrie.session.file_upload",
+    "cowrie.client.version",
+}
+
+
+def cowrie_attack(attacks, line):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return
+    ip = e.get("src_ip")
+    # Las conexiones desde la LAN son pruebas de Alex (o el NAT del router): no son ataques.
+    if not ip or not public_ip(ip):
+        return
+    kind = "telnet" if e.get("protocol") == "telnet" or e.get("dst_port") == 2223 else "ssh"
+    ev = e.get("eventid", "")
+    if ev in COWRIE_EVENTS:
+        attacks.seen(attacks.hit(kind, ip, 0), iso_ms(e.get("timestamp")))
+    if ev == "cowrie.session.connect":
+        r = attacks.hit(kind, ip, 0)
+        r["sessions"] = r.get("sessions", 0) + 1
+    elif ev in ("cowrie.login.failed", "cowrie.login.success"):
+        r = attacks.hit(kind, ip)
+        user = str(e.get("username", ""))[:40]
+        attacks.bump(r, "users", user)
+        attacks.bump(r, "creds", f"{user}:{str(e.get('password', ''))[:40]}")
+        if ev == "cowrie.login.success":
+            r["logins_ok"] = r.get("logins_ok", 0) + 1
+    elif ev == "cowrie.command.input":
+        attacks.push(attacks.hit(kind, ip, 0), "commands", str(e.get("input", ""))[:200])
+    elif ev == "cowrie.session.file_download":
+        attacks.push(
+            attacks.hit(kind, ip, 0),
+            "downloads",
+            {"url": str(e.get("url", ""))[:300], "sha256": e.get("shasum")},
+        )
+    elif ev == "cowrie.session.file_upload":
+        # Lo que suben por SCP/SFTP (p. ej. un binario oculto en /root): Cowrie
+        # guarda la copia en var/lib/cowrie/downloads con su sha256 como nombre.
+        attacks.push(
+            attacks.hit(kind, ip, 0),
+            "downloads",
+            {"url": f"subido: {str(e.get('filename', '?'))[:280]}", "sha256": e.get("shasum")},
+        )
+    elif ev == "cowrie.client.version":
+        attacks.hit(kind, ip, 0).setdefault("client", str(e.get("version", ""))[:120])
+
+
+def tail_lines(path, state):
+    """Líneas nuevas de un log desde la última pasada; sigue la rotación por inodo."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    prev = state.get(path, {})
+    same = prev.get("inode") == st.st_ino and prev.get("pos", 0) <= st.st_size
+    pos = prev.get("pos", 0) if same else 0
+    with open(path, "rb") as f:
+        f.seek(pos)
+        data = f.read(MAX_TAIL_BYTES)
+    end = data.rfind(b"\n") + 1  # solo líneas completas
+    state[path] = {"inode": st.st_ino, "pos": pos + end}
+    return data[:end].decode("utf-8", "replace").splitlines()
+
+
+def log_batch(tail_state):
+    """Avisos del journal y ataques desde la última pasada. Devuelve (lote, cursor nuevo)."""
+    try:
+        with open(JOURNAL_CURSOR) as f:
+            cursor = f.read().strip() or None
+    except FileNotFoundError:
+        cursor = None
+    seed = cursor is None
+    rc, entries = read_journal(["--since", SEED_SINCE] if seed else ["--after-cursor", cursor])
+    if rc != 0 and not entries:
+        # Cursor que ya no existe (journal rotado): seguir desde hace poco.
+        rc, entries = read_journal(["--since", "-10min"])
+
+    groups = {}
+    ufw_blocks = 0
+    attacks = Attacks()
+    last_cursor = cursor
+    for e in entries:
+        last_cursor = e.get("__CURSOR", last_cursor)
+        msg = message_text(e.get("MESSAGE"))
+        if msg.startswith("[UFW "):
+            # Casi todo es multicast de la LAN: el router solo deja pasar puertos
+            # que ufw ya permite. Solo se cuentan.
+            ufw_blocks += 1
+            continue
+        if e.get("_SYSTEMD_UNIT") == "wings.service":
+            wings_attack(attacks, msg, journal_ms(e))
+        if not interesting(e, msg):
+            continue
+        unit = unit_name(e)
+        template = normalize(msg)[:200]
+        fp = hashlib.sha1(f"{unit}|{template}".encode()).hexdigest()[:10]
+        g = groups.get(fp)
+        if g is None:
+            groups[fp] = {
+                "fp": fp,
+                "unit": unit,
+                "template": template,
+                "sample": mask(msg)[:300],
+                "priority": int(e.get("PRIORITY", 6)),
+                "count": 1,
+            }
+        else:
+            g["count"] += 1
+
+    for line in tail_lines(NGINX_LOG, tail_state):
+        nginx_attack(attacks, line)
+    for line in tail_lines(COWRIE_LOG, tail_state):
+        cowrie_attack(attacks, line)
+
+    batch = {
+        "id": int(time.time()),
+        "at": datetime.now(timezone.utc).isoformat(),
+        "seed": seed,
+        "ufw_blocks": ufw_blocks,
+        "patterns": sorted(groups.values(), key=lambda g: -g["count"])[:MAX_PATTERNS_PER_BATCH],
+        "attacks": attacks.out(),
+        "sftp_failed_other": attacks.sftp_failed_other,
+        "own_ips": sorted(own_ips()),
+    }
+    return batch, last_cursor
+
+
+def write_json(name, data):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    tmp = os.path.join(OUT_DIR, f".{name}.{os.getpid()}")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.chmod(tmp, 0o640)
+    try:
+        shutil.chown(tmp, group="opsbot")
+    except (LookupError, PermissionError):
+        pass  # sin el grupo (p. ej. en pruebas) queda solo para root
+    os.replace(tmp, os.path.join(OUT_DIR, name))  # atómico
+
+
+STATS_KEEP_MS = 31 * 86_400_000
+STATS_REBUILD_KINDS = ["sftp", "web", "ssh", "telnet"]
+
+
+def log_files(path):
+    """El log y sus rotaciones (.1, .2.gz…, cowrie.json.AAAA-MM-DD), el actual al final."""
+    import glob
+
+    return sorted((p for p in glob.glob(path + ".*") if p != path), key=os.path.getmtime) + [path]
+
+
+def read_upto(path, tail_state):
+    """Líneas de un log; del actual, solo hasta donde ya leyeron las pasadas normales."""
+    import gzip
+
+    limit = None
+    prev = tail_state.get(path)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    if path in tail_state:
+        limit = prev.get("pos", 0) if prev.get("inode") == st.st_ino else 0
+    opener = gzip.open if path.endswith(".gz") else open
+    read = 0
+    with opener(path, "rb") as f:
+        for raw in f:
+            read += len(raw)
+            if limit is not None and read > limit:
+                return
+            yield raw.decode("utf-8", "replace")
+
+
+def stats_rebuild(tail_state, cursor):
+    """Una vez: usuarios, credenciales, comandos y rutas por hora de los últimos
+    31 días, sacados de los logs (cada línea trae su hora). El bot borra las
+    tablas por ventana y las rehace con esto. Solo llega hasta lo ya leído por
+    las pasadas normales; lo de después viene en los lotes de siempre."""
+    m = re.search(r"\bt=([0-9a-f]+)", cursor or "")
+    if not m:
+        return None
+    until = int(m.group(1), 16) // 1000
+    since = until - STATS_KEEP_MS
+    hours = {}
+
+    # Cowrie y nginx ya van acotados por la posición leída; Wings, por el cursor.
+    def bucket(ts, upto=None):
+        if ts is None or ts < since or (upto is not None and ts > upto):
+            return None
+        a = hours.get(ts // 3_600_000)
+        if a is None:
+            a = hours[ts // 3_600_000] = Attacks()
+            a.limit = 2000
+        return a
+
+    for path in log_files(COWRIE_LOG):
+        for line in read_upto(path, tail_state):
+            if '"timestamp"' not in line:
+                continue
+            try:
+                a = bucket(iso_ms(json.loads(line).get("timestamp")))
+            except ValueError:
+                continue
+            if a:
+                cowrie_attack(a, line)
+    for path in log_files(NGINX_LOG):
+        for line in read_upto(path, tail_state):
+            m = NGINX_LINE.match(line)
+            a = m and bucket(nginx_ms(m.group(2)))
+            if a:
+                nginx_attack(a, line)
+    _, entries = read_journal(["-u", "wings", "--since", "-31d"])
+    for e in entries:
+        ts = journal_ms(e)
+        a = bucket(ts, until)
+        if a:
+            wings_attack(a, message_text(e.get("MESSAGE")), ts)
+
+    records = []
+    for hour, a in hours.items():
+        for r in a.by.values():
+            keep = {k: r[k] for k in ("kind", "ip", "count", "users", "creds", "commands", "paths") if k in r}
+            keep["ts"] = r.get("ts", hour * 3_600_000)
+            records.append(keep)
+    return {"kinds": STATS_REBUILD_KINDS, "until": until, "attacks": records}
+
+
+def collect_logs():
+    try:
+        with open(TAIL_STATE) as f:
+            tail_state = json.load(f)
+    except (FileNotFoundError, ValueError):
+        tail_state = {}
+    rebuild = None
+    if tail_state and not tail_state.get("stats_rebuilt"):
+        try:
+            with open(JOURNAL_CURSOR) as f:
+                rebuild = stats_rebuild(dict(tail_state), f.read().strip())
+        except Exception as err:  # que nunca tumbe la pasada normal
+            print(f"ops-collect: no se pudieron rehacer las tablas por ventana: {err}")
+    batch, cursor = log_batch(tail_state)
+    if rebuild:
+        batch["stats_rebuild"] = rebuild
+    tail_state["stats_rebuilt"] = True
+    try:
+        with open(os.path.join(OUT_DIR, "logs.json")) as f:
+            batches = json.load(f).get("batches", [])
+    except (FileNotFoundError, ValueError):
+        batches = []
+    batches = (batches + [batch])[-KEEP_LOG_BATCHES:]
+    write_json("logs.json", {"batches": batches})
+    # Los cursores se guardan después: si algo falla antes, la próxima pasada relee.
+    if cursor:
+        with open(JOURNAL_CURSOR, "w") as f:
+            f.write(cursor)
+    with open(TAIL_STATE, "w") as f:
+        json.dump(tail_state, f)
+    return batch
+
+
+def backfill_attacks():
+    """Una vez: ataques al SFTP de Wings de los últimos 7 días, como lote semilla
+    (cuenta en los totales e IPs, no en la línea de tiempo). Para cuando el
+    aprendizaje inicial lo hizo una versión que aún no extraía ataques."""
+    rc, entries = read_journal(["-u", "wings", "--since", SEED_SINCE])
+    attacks = Attacks()
+    for e in entries:
+        wings_attack(attacks, message_text(e.get("MESSAGE")))
+    batch = {
+        "id": int(time.time()),
+        "at": datetime.now(timezone.utc).isoformat(),
+        "seed": True,
+        "ufw_blocks": 0,
+        "patterns": [],
+        "attacks": attacks.out(),
+        "sftp_failed_other": attacks.sftp_failed_other,
+    }
+    try:
+        with open(os.path.join(OUT_DIR, "logs.json")) as f:
+            batches = json.load(f).get("batches", [])
+    except (FileNotFoundError, ValueError):
+        batches = []
+    write_json("logs.json", {"batches": (batches + [batch])[-KEEP_LOG_BATCHES:]})
+    total = sum(a["count"] for a in batch["attacks"])
+    print(f"ops-collect: recuperados {total} intentos de {len(batch['attacks'])} IPs (journalctl rc={rc})")
+
+
+def backfill_cowrie_files():
+    """Una vez: archivos subidos o descargados en el honeypot que ya estaban en
+    los logs de Cowrie antes de que el recolector supiera leerlos. Entran como
+    lote semilla (en la tabla de archivos cazados, sin feed ni aviso)."""
+    import glob
+
+    attacks = Attacks()
+    for path in sorted(glob.glob(COWRIE_LOG + "*")):
+        with open(path, errors="replace") as f:
+            for line in f:
+                if '"cowrie.session.file_' in line:
+                    cowrie_attack(attacks, line)
+    batch = {
+        "id": int(time.time()),
+        "at": datetime.now(timezone.utc).isoformat(),
+        "seed": True,
+        "ufw_blocks": 0,
+        "patterns": [],
+        "attacks": attacks.out(),
+        "sftp_failed_other": 0,
+    }
+    try:
+        with open(os.path.join(OUT_DIR, "logs.json")) as f:
+            batches = json.load(f).get("batches", [])
+    except (FileNotFoundError, ValueError):
+        batches = []
+    write_json("logs.json", {"batches": (batches + [batch])[-KEEP_LOG_BATCHES:]})
+    files = sum(len(a.get("downloads", [])) for a in batch["attacks"])
+    print(f"ops-collect: recuperados {files} archivos del honeypot de {len(batch['attacks'])} IPs")
+
+
+def main():
+    snapshot = {
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+        "system": section(system),
+        "smart": section(smart),
+        "services": section(services),
+        "backups": section(backups),
+        "containers": section(clients),
+        "certificates": section(certificates),
+        "simulacro": section(simulacro),
+        "deploys": section(deploys),
+        "fail2ban": section(fail2ban),
+        "wings": section(wings),
+        "wings_remote": section(wings_remote),
+    }
+    write_json("snapshot.json", snapshot)
+    logs = section(collect_logs)
+    if "error" in logs:
+        print(f"ops-collect: logs: {logs['error']}")
+    else:
+        print(
+            f"ops-collect: logs: {len(logs['patterns'])} huellas, {logs['ufw_blocks']} bloqueos de ufw, "
+            f"{len(logs['attacks'])} atacantes"
+        )
+
+
+if __name__ == "__main__":
+    import sys
+
+    start = time.monotonic()
+    if sys.argv[1:] == ["--backfill-attacks"]:
+        backfill_attacks()
+    elif sys.argv[1:] == ["--backfill-cowrie-files"]:
+        backfill_cowrie_files()
+    else:
+        main()
+    print(f"ops-collect: ok en {time.monotonic() - start:.1f} s")

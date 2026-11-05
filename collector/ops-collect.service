@@ -1,0 +1,9 @@
+[Unit]
+Description=Recolector del asistente (estado del servidor en JSON)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ops-collect
+# Que no le quite CPU ni disco a Bentonime ni a los servidores de juego.
+Nice=10
+IOSchedulingClass=idle

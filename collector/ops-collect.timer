@@ -1,0 +1,11 @@
+[Unit]
+Description=Recolector del asistente cada 5 minutos
+
+[Timer]
+# Hora de reloj fija, desfasada 2 min del latido. No usar OnUnitActiveSec:
+# activado con el sistema ya arrancado se queda sin próxima ejecución.
+OnCalendar=*:2/5
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
