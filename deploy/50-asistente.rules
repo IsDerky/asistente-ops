@@ -1,0 +1,13 @@
+// Asistente de operaciones: lo ÚNICO que el usuario opsbot puede hacer con
+// systemd. Sin sudo; el bot usa `systemctl --no-ask-password …` y polkit
+// decide. Cualquier otra unidad o verbo sigue denegado.
+polkit.addRule(function (action, subject) {
+  if (action.id !== "org.freedesktop.systemd1.manage-units" || subject.user !== "opsbot") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  var unit = action.lookup("unit");
+  var verb = action.lookup("verb");
+  if (unit === "bentonime.service" && verb === "restart") return polkit.Result.YES;
+  if (unit === "server-backup@sistema.service" && verb === "start") return polkit.Result.YES;
+  return polkit.Result.NO;
+});

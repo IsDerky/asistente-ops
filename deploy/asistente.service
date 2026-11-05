@@ -1,0 +1,33 @@
+[Unit]
+Description=Asistente de operaciones (bot de Discord con Groq)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=opsbot
+Group=opsbot
+WorkingDirectory=/opt/asistente/bot
+EnvironmentFile=/etc/asistente.env
+ExecStart=/usr/local/bin/bun src/index.ts
+Restart=on-failure
+RestartSec=30s
+# Su histórico (SQLite) en /var/lib/asistente, propiedad de opsbot.
+StateDirectory=asistente
+Environment=ASSISTANT_DATA_DIR=/var/lib/asistente
+# opsbot no tiene carpeta personal: Bun guarda aquí su caché.
+Environment=HOME=/var/lib/asistente
+
+# Sin privilegios: solo lee el snapshot del recolector y habla por la red.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
