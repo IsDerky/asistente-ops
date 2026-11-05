@@ -7,3 +7,4 @@ __pycache__/
 /bun
 # Token de los hooks de Claude Code (deploy/claude-hooks.mjs --token)
 /claude-hook-token
+watchdog/dist/

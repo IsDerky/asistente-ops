@@ -1,0 +1,5 @@
+# Copiar a terraform.tfvars (no va a git)
+account_id        = "<id de la cuenta de Cloudflare>"
+discord_user_id   = "<tu ID de Discord>"
+ping_token        = "<openssl rand -hex 32>"
+discord_bot_token = "<token del bot>"
