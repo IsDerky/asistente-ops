@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ops-watchdog",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "observability": { "enabled": true },
+  // Cada 5 min: revisa cuánto lleva cada señal sin llegar.
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "kv_namespaces": [
+    // El id lo da `npx wrangler kv namespace create STATE` (ver README).
+    { "binding": "STATE", "id": "<id del namespace>" }
+  ]
+  // Secretos (npx wrangler secret put …): PING_TOKEN, DISCORD_BOT_TOKEN, DISCORD_USER_ID
+}
