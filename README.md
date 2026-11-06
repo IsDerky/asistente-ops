@@ -32,9 +32,9 @@ El recolector corre como root porque necesita leer SMART, el journal y fail2ban.
 ## Qué recoge el recolector
 
 - Sistema, SMART, servicios, backups y simulacro de restauración, certificados de Let's Encrypt, `docker stats`, baneos de fail2ban y la versión desplegada de mi app.
-- **Pterodactyl**: estado y consumo de los servidores de cada nodo, preguntando a la API de Wings. Los tokens se pasan a curl por stdin para que no salgan en `ps`, y la configuración de los servidores de los clientes se descarta sin guardarla.
+- **Pterodactyl**: estado y consumo de los servidores de cada nodo, preguntando a la API de Wings. Los tokens se pasan a curl por stdin para que no salgan en `ps`, y la configuración de cada servidor de juego se descarta sin guardarla.
 - **Journal**: los avisos se agrupan por huella (el mensaje sin números, IDs, IPs, rutas ni fechas), así se distingue lo nuevo de lo de siempre.
-- **Ataques**: fuerza bruta al SFTP de Wings, sondas web en los logs de nginx y el honeypot Cowrie, incluidos los ficheros que suben. Del SFTP solo se guarda el usuario si no tiene el formato de los usuarios de Pterodactyl, o sea, si seguro que no es un cliente.
+- **Ataques**: fuerza bruta al SFTP de Wings, sondas web en los logs de nginx y el honeypot Cowrie, incluidos los ficheros que suben. Del SFTP solo se guarda el usuario si no tiene el formato de los usuarios de Pterodactyl, o sea, si seguro que no es alguien con cuenta en el panel.
 
 ## Qué hace el bot
 
@@ -42,7 +42,7 @@ El recolector corre como root porque necesita leer SMART, el journal y fail2ban.
 - **Acciones con botón**: el modelo solo puede *proponer* (reiniciar la app, lanzar un backup, encolar descargas). Se ejecutan cuando pulso Confirmar; el botón es de un solo uso y caduca a los 10 minutos. Los permisos los da polkit (`deploy/50-asistente.rules`): `opsbot` solo puede reiniciar una unidad y arrancar otra, nada más.
 - **Memoria de incidentes** con búsqueda FTS5: antes de diagnosticar, el modelo mira si ya pasó y qué lo arregló. Viene precargada con incidentes reales del servidor.
 - **Caducidades**: certificados (avisa a 20, 7 y 2 días), dominios por RDAP y recordatorios que le dicto ("recuérdame el 5/12 renovar…").
-- **Resumen diario** por la mañana con lo que importa: backups, caducidades, ataques, el servidor de clientes que más RAM usa…
+- **Resumen diario** por la mañana con lo que importa: backups, caducidades, ataques, el servidor de juego que más RAM usa…
 - **Solo avisa de lo grave.** Las anomalías de logs las aprende en silencio y me las cuenta si le pregunto; probé a avisar de todo y era ruido.
 - **API local para el [panel de la LAN](https://github.com/IsDerky/oficina-pixel)** (`/api/state`, `/api/events` por SSE, `/api/honeypot`…). Escucha solo en `127.0.0.1` y nginx la publica solo para la LAN.
 
